@@ -2,6 +2,10 @@ name: AI Arbitrage Historical Validation
 
 on:
   workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/historical-validation.yml"
   schedule:
     - cron: "17 * * * *"
 
