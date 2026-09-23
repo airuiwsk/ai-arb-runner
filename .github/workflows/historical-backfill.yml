@@ -11,6 +11,7 @@ on:
     - cron: "37 * * * *"
 
 permissions:
+  actions: write
   contents: read
 
 concurrency:
@@ -244,3 +245,13 @@ jobs:
           else
             echo "No backfill state yet; waiting for overlap gate."
           fi
+
+      - name: Dispatch successor
+        if: steps.guard.outputs.skip != 'true' && steps.chunk.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 45
+          gh workflow run historical-backfill.yml --repo "$GITHUB_REPOSITORY"
