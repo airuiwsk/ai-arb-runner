@@ -24,7 +24,6 @@ jobs:
       PRIVATE_REPO: airuiwsk/AI-Arbitrage
       SOURCE_BRANCH: github-observer
       ARCHIVE_BRANCH: telemetry
-      ETH_RPC_URL: https://ethereum-rpc.publicnode.com
       OVERLAP_BLOCK: "26032286"
       OVERLAP_LIVE_JSONL: data/telemetry/2026-09-22/19.jsonl
     steps:
@@ -68,9 +67,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install scanner
+      - name: Install scanner and tests
         if: steps.guard.outputs.skip != 'true'
-        run: python -m pip install -e source
+        run: python -m pip install -e 'source[dev]'
+
+      - name: Historical unit tests
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          pytest -q             source/tests/test_historical_backfill.py             source/tests/test_historical_overlap.py             source/tests/test_historical_rpc_smoke.py
 
       - name: Historical archive-RPC smoke
         if: steps.guard.outputs.skip != 'true'
@@ -87,7 +91,8 @@ jobs:
           : > "$RUNNER_TEMP/historical-smoke-attempts.log"
           selected=""
           for rpc in "${providers[@]}"; do
-            echo "Testing historical RPC host: $(printf '%s' "$rpc" | sed -E 's#https?://([^/]+).*#\\1#')" | tee -a "$RUNNER_TEMP/historical-smoke-attempts.log"
+            host="$(python -c 'import sys,urllib.parse; print(urllib.parse.urlparse(sys.argv[1]).netloc)' "$rpc")"
+            echo "Testing historical RPC host: $host" | tee -a "$RUNNER_TEMP/historical-smoke-attempts.log"
             set +e
             ETH_RPC_URL="$rpc" ai-arbitrage-historical-rpc-smoke > "$RUNNER_TEMP/historical-smoke-one.log" 2>&1
             rc=$?
@@ -119,7 +124,7 @@ jobs:
           Path("archive/data/backfill/gates/archive-rpc-smoke.json").write_text(json.dumps(row, indent=2, sort_keys=True) + "\n")
           PY
 
-      - name: Recompute deterministic overlap block
+      - name: Recompute deterministic overlap block with scanner v2
         if: steps.guard.outputs.skip != 'true'
         shell: bash
         env:
@@ -127,19 +132,52 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf "$RUNNER_TEMP/backfill-overlap"
-          ai-arbitrage-historical-backfill \
-            --start-block "$OVERLAP_BLOCK" \
-            --end-block "$OVERLAP_BLOCK" \
-            --output-dir "$RUNNER_TEMP/backfill-overlap"
-          cp "$RUNNER_TEMP/backfill-overlap/$OVERLAP_BLOCK.json" \
-            "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-historical.json"
+          ai-arbitrage-historical-backfill             --start-block "$OVERLAP_BLOCK"             --end-block "$OVERLAP_BLOCK"             --workers 1             --output-dir "$RUNNER_TEMP/backfill-overlap"
+          cp "$RUNNER_TEMP/backfill-overlap/$OVERLAP_BLOCK.json"             "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-historical.json"
 
-      - name: Compare live and historical economics
+      - name: Compare identical live and historical economics
         if: steps.guard.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
           ai-arbitrage-historical-overlap             --live-jsonl "archive/$OVERLAP_LIVE_JSONL"             --historical-json "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-historical.json"             --output "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-result.json"
+
+      - name: Benchmark sequential vs four-worker v2 backfill
+        if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        env:
+          ETH_RPC_URL: ${{ steps.smoke.outputs.rpc_url }}
+        run: |
+          set -euo pipefail
+          BENCH_START=$((OVERLAP_BLOCK - 7))
+          rm -rf "$RUNNER_TEMP/bench-1" "$RUNNER_TEMP/bench-4"
+          start_ms=$(date +%s%3N)
+          ai-arbitrage-historical-backfill             --start-block "$BENCH_START"             --end-block "$OVERLAP_BLOCK"             --workers 1             --output-dir "$RUNNER_TEMP/bench-1"             --compact-jsonl "$RUNNER_TEMP/bench-1.jsonl"             --discard-evidence
+          seq_ms=$(( $(date +%s%3N) - start_ms ))
+          start_ms=$(date +%s%3N)
+          ai-arbitrage-historical-backfill             --start-block "$BENCH_START"             --end-block "$OVERLAP_BLOCK"             --workers 4             --output-dir "$RUNNER_TEMP/bench-4"             --compact-jsonl "$RUNNER_TEMP/bench-4.jsonl"             --discard-evidence
+          par_ms=$(( $(date +%s%3N) - start_ms ))
+          SEQ_MS="$seq_ms" PAR_MS="$par_ms" BENCH_START="$BENCH_START" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          seq = int(os.environ["SEQ_MS"])
+          par = int(os.environ["PAR_MS"])
+          result = {
+              "blocks": 8,
+              "start_block": int(os.environ["BENCH_START"]),
+              "end_block": 26032286,
+              "scanner_generation": "v2_cached_batch",
+              "sequential_ms": seq,
+              "parallel_4_ms": par,
+              "speedup": round(seq / par, 3) if par else None,
+              "read_only": True,
+              "execution_enabled": False,
+          }
+          Path("archive/data/backfill/gates/v2-backfill-benchmark.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n"
+          )
+          print(json.dumps(result, sort_keys=True))
+          PY
 
       - name: Record validation state
         if: steps.guard.outputs.skip != 'true'
@@ -151,14 +189,18 @@ jobs:
           from pathlib import Path
           overlap = json.loads(Path("archive/data/backfill/gates/overlap-26032286-result.json").read_text())
           smoke = json.loads(Path("archive/data/backfill/gates/archive-rpc-smoke.json").read_text())
+          benchmark = json.loads(Path("archive/data/backfill/gates/v2-backfill-benchmark.json").read_text())
           state = {
-              "schema_version": 1,
+              "schema_version": 2,
               "updated_at_unix": int(time.time()),
               "archive_rpc_gate": smoke["status"],
+              "archive_rpc_host": smoke["rpc_host"],
               "overlap_gate": overlap["status"],
               "overlap_block": overlap["block_number"],
               "overlap_block_hash": overlap["block_hash"],
               "compared_economics": overlap["compared_economics"],
+              "scanner_generation": "v2_cached_batch",
+              "benchmark": benchmark,
               "read_only": True,
               "execution_enabled": False,
               "ready_for_execution": False,
