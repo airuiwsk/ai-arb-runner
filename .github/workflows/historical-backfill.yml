@@ -4,7 +4,7 @@ name: AI Arbitrage Seven Day Backfill
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["github-observer"]
     paths:
       - ".github/workflows/historical-backfill.yml"
   schedule:
@@ -29,7 +29,7 @@ jobs:
       ETH_RPC_URL: https://eth-mainnet.g.alchemy.com/public
       WINDOW_END: "26032286"
       WINDOW_BLOCKS: "50400"
-      CHUNK_SIZE: "360"
+      CHUNK_SIZE: "240"
       HISTORICAL_WORKERS: "1"
     steps:
       - name: Check private token
