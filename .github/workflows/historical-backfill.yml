@@ -1,4 +1,5 @@
 name: AI Arbitrage Seven Day Backfill
+# gate unlocked: scanner-v2 overlap PASS
 
 on:
   workflow_dispatch:
