@@ -1,0 +1,70 @@
+name: AI Arbitrage Backfill Chain Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      hop:
+        required: false
+        default: "0"
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/backfill-chain-smoke.yml"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: ai-arb-backfill-chain-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PRIVATE_REPO: airuiwsk/AI-Arbitrage
+      ARCHIVE_BRANCH: telemetry
+    steps:
+      - name: Checkout telemetry archive
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.ARCHIVE_BRANCH }}
+          token: ${{ secrets.AI_ARBITRAGE_PAT }}
+          path: archive
+          persist-credentials: false
+
+      - name: Persist unique smoke marker with rebase retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd archive
+          mkdir -p data/backfill/smoke
+          printf '{"run_id":"%s","event":"%s","hop":"%s"}\n' "$GITHUB_RUN_ID" "$GITHUB_EVENT_NAME" "${{ inputs.hop }}"             > "data/backfill/smoke/$GITHUB_RUN_ID.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "data/backfill/smoke/$GITHUB_RUN_ID.json"
+          git commit -m "Backfill chain smoke $GITHUB_RUN_ID"
+          REMOTE="https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git"
+          pushed=false
+          for attempt in 1 2 3 4 5; do
+            git fetch "$REMOTE" "$ARCHIVE_BRANCH"
+            git rebase FETCH_HEAD
+            if git push "$REMOTE" HEAD:$ARCHIVE_BRANCH; then
+              pushed=true
+              break
+            fi
+            sleep $((attempt * 3))
+          done
+          [ "$pushed" = true ] || exit 1
+
+      - name: Dispatch one successor
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run backfill-chain-smoke.yml --repo "$GITHUB_REPOSITORY" -f hop=1
