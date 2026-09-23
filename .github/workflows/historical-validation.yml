@@ -1,0 +1,146 @@
+name: AI Arbitrage Historical Validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-arb-historical-validation
+  cancel-in-progress: false
+
+jobs:
+  historical:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      PRIVATE_REPO: airuiwsk/AI-Arbitrage
+      SOURCE_BRANCH: github-observer
+      ARCHIVE_BRANCH: telemetry
+      ETH_RPC_URL: https://ethereum-rpc.publicnode.com
+      OVERLAP_BLOCK: "26032286"
+      OVERLAP_LIVE_JSONL: data/telemetry/2026-09-22/19.jsonl
+    steps:
+      - name: Check private token
+        id: guard
+        env:
+          PRIVATE_PAT: ${{ secrets.AI_ARBITRAGE_PAT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${PRIVATE_PAT:-}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "AI_ARBITRAGE_PAT is missing; historical validation remains idle."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout private scanner
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.SOURCE_BRANCH }}
+          token: ${{ secrets.AI_ARBITRAGE_PAT }}
+          path: source
+          persist-credentials: false
+
+      - name: Checkout telemetry archive
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.ARCHIVE_BRANCH }}
+          token: ${{ secrets.AI_ARBITRAGE_PAT }}
+          path: archive
+          persist-credentials: false
+
+      - name: Set up Python
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scanner
+        if: steps.guard.outputs.skip != 'true'
+        run: python -m pip install -e source
+
+      - name: Historical archive-RPC smoke
+        if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p archive/data/backfill/gates
+          ai-arbitrage-historical-rpc-smoke | tee "$RUNNER_TEMP/historical-smoke.log"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          lines = Path(os.environ["RUNNER_TEMP"]).joinpath("historical-smoke.log").read_text().splitlines()
+          prefix = "AI_ARBITRAGE_HISTORICAL_RPC_SMOKE "
+          rows = [json.loads(line[len(prefix):]) for line in lines if line.startswith(prefix)]
+          if len(rows) != 1:
+              raise SystemExit("expected exactly one historical smoke result")
+          row = rows[0]
+          if row.get("status") != "pass" or row.get("chain_id") != 1 or int(row.get("age_blocks", 0)) < 50400 or int(row.get("return_bytes", 0)) != 32:
+              raise SystemExit(f"historical RPC gate failed: {row}")
+          Path("archive/data/backfill/gates/archive-rpc-smoke.json").write_text(json.dumps(row, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - name: Recompute deterministic overlap block
+        if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/backfill-overlap"
+          ai-arbitrage-historical-backfill             --start-block "$OVERLAP_BLOCK"             --end-block "$OVERLAP_BLOCK"             --output-dir "$RUNNER_TEMP/backfill-overlap"
+          cp "$RUNNER_TEMP/backfill-overlap/$OVERLAP_BLOCK.json"             "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-historical.json"
+
+      - name: Compare live and historical economics
+        if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ai-arbitrage-historical-overlap             --live-jsonl "archive/$OVERLAP_LIVE_JSONL"             --historical-json "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-historical.json"             --output "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-result.json"
+
+      - name: Record validation state
+        if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, time
+          from pathlib import Path
+          overlap = json.loads(Path("archive/data/backfill/gates/overlap-26032286-result.json").read_text())
+          smoke = json.loads(Path("archive/data/backfill/gates/archive-rpc-smoke.json").read_text())
+          state = {
+              "schema_version": 1,
+              "updated_at_unix": int(time.time()),
+              "archive_rpc_gate": smoke["status"],
+              "overlap_gate": overlap["status"],
+              "overlap_block": overlap["block_number"],
+              "overlap_block_hash": overlap["block_hash"],
+              "compared_economics": overlap["compared_economics"],
+              "read_only": True,
+              "execution_enabled": False,
+              "ready_for_execution": False,
+              "next_gate": "seven_day_backfill" if overlap["status"] == "pass" else "investigate_overlap_difference",
+          }
+          Path("archive/data/backfill/state.json").write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - name: Persist historical gate evidence
+        if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd archive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/backfill
+          if ! git diff --cached --quiet; then
+            git commit -m "Record historical validation gates"
+            git push "https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git" HEAD:$ARCHIVE_BRANCH
+          fi
