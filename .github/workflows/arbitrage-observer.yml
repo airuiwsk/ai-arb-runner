@@ -102,7 +102,18 @@ jobs:
           git add data/observer/state.json
           if ! git diff --cached --quiet; then
             git commit -m "Start AI-Arbitrage observation window"
-            git push "https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git" HEAD:$ARCHIVE_BRANCH
+            REMOTE="https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git"
+            pushed=false
+            for attempt in 1 2 3 4 5; do
+              git fetch "$REMOTE" "$ARCHIVE_BRANCH"
+              git rebase FETCH_HEAD
+              if git push "$REMOTE" HEAD:$ARCHIVE_BRANCH; then
+                pushed=true
+                break
+              fi
+              sleep $((attempt * 3))
+            done
+            [ "$pushed" = true ] || exit 1
           fi
 
       - name: Set up Python
@@ -160,7 +171,18 @@ jobs:
             git add data/telemetry data/opportunities
             if ! git diff --cached --quiet; then
               git commit -m "Hourly observer flush $GITHUB_RUN_ID"
-              git push "https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git" HEAD:$ARCHIVE_BRANCH
+              REMOTE="https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git"
+              pushed=false
+              for attempt in 1 2 3 4 5; do
+                git fetch "$REMOTE" "$ARCHIVE_BRANCH"
+                git rebase FETCH_HEAD
+                if git push "$REMOTE" HEAD:$ARCHIVE_BRANCH; then
+                  pushed=true
+                  break
+                fi
+                sleep $((attempt * 3))
+              done
+              [ "$pushed" = true ] || exit 1
             fi
             cd ..
           }
@@ -213,7 +235,18 @@ jobs:
           git add data/telemetry data/opportunities data/observer
           if ! git diff --cached --quiet; then
             git commit -m "Archive observer run $GITHUB_RUN_ID"
-            git push "https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git" HEAD:$ARCHIVE_BRANCH
+            REMOTE="https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git"
+            pushed=false
+            for attempt in 1 2 3 4 5; do
+              git fetch "$REMOTE" "$ARCHIVE_BRANCH"
+              git rebase FETCH_HEAD
+              if git push "$REMOTE" HEAD:$ARCHIVE_BRANCH; then
+                pushed=true
+                break
+              fi
+              sleep $((attempt * 3))
+            done
+            [ "$pushed" = true ] || exit 1
           fi
 
       - name: Mark experiment complete
@@ -236,7 +269,18 @@ jobs:
           git add data/observer/state.json
           if ! git diff --cached --quiet; then
             git commit -m "Complete AI-Arbitrage observation window"
-            git push "https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git" HEAD:$ARCHIVE_BRANCH
+            REMOTE="https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git"
+            pushed=false
+            for attempt in 1 2 3 4 5; do
+              git fetch "$REMOTE" "$ARCHIVE_BRANCH"
+              git rebase FETCH_HEAD
+              if git push "$REMOTE" HEAD:$ARCHIVE_BRANCH; then
+                pushed=true
+                break
+              fi
+              sleep $((attempt * 3))
+            done
+            [ "$pushed" = true ] || exit 1
           fi
 
       - name: Dispatch successor
