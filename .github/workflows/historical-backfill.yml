@@ -27,7 +27,7 @@ jobs:
       ETH_RPC_URL: https://eth-mainnet.g.alchemy.com/public
       WINDOW_END: "26032286"
       WINDOW_BLOCKS: "50400"
-      CHUNK_SIZE: "600"
+      CHUNK_SIZE: "360"
       HISTORICAL_WORKERS: "1"
     steps:
       - name: Check private token
@@ -156,7 +156,15 @@ jobs:
           END="${{ steps.chunk.outputs.end }}"
           mkdir -p archive/data/backfill/chunks
           rm -rf "$RUNNER_TEMP/backfill-blocks"
-          ai-arbitrage-historical-backfill             --start-block "$START"             --end-block "$END"             --workers "$HISTORICAL_WORKERS"             --output-dir "$RUNNER_TEMP/backfill-blocks"             --compact-jsonl "archive/data/backfill/chunks/$START-$END.jsonl"             --discard-evidence
+          HISTORICAL_BLOCK_MAX_ATTEMPTS=5 HISTORICAL_RETRY_BASE_SECONDS=15 \
+          ai-arbitrage-historical-backfill \
+            --start-block "$START" \
+            --end-block "$END" \
+            --workers "$HISTORICAL_WORKERS" \
+            --inter-block-delay 3 \
+            --output-dir "$RUNNER_TEMP/backfill-blocks" \
+            --compact-jsonl "archive/data/backfill/chunks/$START-$END.jsonl" \
+            --discard-evidence
 
       - name: Summarize chunk and advance checkpoint
         if: steps.guard.outputs.skip != 'true' && steps.chunk.outputs.should_run == 'true'
