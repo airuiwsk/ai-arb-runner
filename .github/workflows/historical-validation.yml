@@ -143,34 +143,33 @@ jobs:
           set -euo pipefail
           ai-arbitrage-historical-overlap             --live-jsonl "archive/$OVERLAP_LIVE_JSONL"             --historical-json "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-historical.json"             --output "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-result.json"
 
-      - name: Benchmark sequential vs four-worker v2 backfill
+      - name: Benchmark stable single-worker v2 backfill
         if: steps.guard.outputs.skip != 'true'
         shell: bash
         env:
           ETH_RPC_URL: ${{ steps.smoke.outputs.rpc_url }}
         run: |
           set -euo pipefail
-          BENCH_START=$((OVERLAP_BLOCK - 7))
-          rm -rf "$RUNNER_TEMP/bench-1" "$RUNNER_TEMP/bench-4"
+          BENCH_START=$((OVERLAP_BLOCK - 11))
+          rm -rf "$RUNNER_TEMP/bench-1"
           start_ms=$(date +%s%3N)
           ai-arbitrage-historical-backfill             --start-block "$BENCH_START"             --end-block "$OVERLAP_BLOCK"             --workers 1             --output-dir "$RUNNER_TEMP/bench-1"             --compact-jsonl "$RUNNER_TEMP/bench-1.jsonl"             --discard-evidence
-          seq_ms=$(( $(date +%s%3N) - start_ms ))
-          start_ms=$(date +%s%3N)
-          ai-arbitrage-historical-backfill             --start-block "$BENCH_START"             --end-block "$OVERLAP_BLOCK"             --workers 4             --output-dir "$RUNNER_TEMP/bench-4"             --compact-jsonl "$RUNNER_TEMP/bench-4.jsonl"             --discard-evidence
-          par_ms=$(( $(date +%s%3N) - start_ms ))
-          SEQ_MS="$seq_ms" PAR_MS="$par_ms" BENCH_START="$BENCH_START" python - <<'PY'
+          wall_ms=$(( $(date +%s%3N) - start_ms ))
+          WALL_MS="$wall_ms" BENCH_START="$BENCH_START" python - <<'PY'
           import json, os
           from pathlib import Path
-          seq = int(os.environ["SEQ_MS"])
-          par = int(os.environ["PAR_MS"])
+          wall = int(os.environ["WALL_MS"])
+          blocks = 12
           result = {
-              "blocks": 8,
+              "blocks": blocks,
               "start_block": int(os.environ["BENCH_START"]),
               "end_block": 26032286,
               "scanner_generation": "v2_cached_batch",
-              "sequential_ms": seq,
-              "parallel_4_ms": par,
-              "speedup": round(seq / par, 3) if par else None,
+              "workers": 1,
+              "wall_ms": wall,
+              "ms_per_block": round(wall / blocks, 1),
+              "blocks_per_hour_estimate": round(blocks * 3_600_000 / wall, 1) if wall else None,
+              "parallel_4_result": "rejected_due_to_429_rate_limit",
               "read_only": True,
               "execution_enabled": False,
           }
