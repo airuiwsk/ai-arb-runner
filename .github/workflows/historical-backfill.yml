@@ -27,8 +27,8 @@ jobs:
       ETH_RPC_URL: https://eth-mainnet.g.alchemy.com/public
       WINDOW_END: "26032286"
       WINDOW_BLOCKS: "50400"
-      CHUNK_SIZE: "360"
-      HISTORICAL_WORKERS: "4"
+      CHUNK_SIZE: "600"
+      HISTORICAL_WORKERS: "1"
     steps:
       - name: Check private token
         id: guard
@@ -108,7 +108,7 @@ jobs:
                   "next_block": start,
                   "completed_blocks": 0,
                   "chunk_size": chunk_size,
-                  "workers": 4,
+                  "workers": 1,
                   "status": "running",
                   "started_at_unix": int(time.time()),
                   "read_only": True,
