@@ -74,11 +74,37 @@ jobs:
 
       - name: Historical archive-RPC smoke
         if: steps.guard.outputs.skip != 'true'
+        id: smoke
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p archive/data/backfill/gates
-          ai-arbitrage-historical-rpc-smoke | tee "$RUNNER_TEMP/historical-smoke.log"
+          providers=(
+            "https://ethereum-rpc.publicnode.com"
+            "https://eth-mainnet.g.alchemy.com/public"
+            "https://eth.llamarpc.com"
+          )
+          : > "$RUNNER_TEMP/historical-smoke-attempts.log"
+          selected=""
+          for rpc in "${providers[@]}"; do
+            echo "Testing historical RPC host: $(printf '%s' "$rpc" | sed -E 's#https?://([^/]+).*#\\1#')" | tee -a "$RUNNER_TEMP/historical-smoke-attempts.log"
+            set +e
+            ETH_RPC_URL="$rpc" ai-arbitrage-historical-rpc-smoke > "$RUNNER_TEMP/historical-smoke-one.log" 2>&1
+            rc=$?
+            set -e
+            cat "$RUNNER_TEMP/historical-smoke-one.log" >> "$RUNNER_TEMP/historical-smoke-attempts.log"
+            if [ "$rc" -eq 0 ] && grep -q '^AI_ARBITRAGE_HISTORICAL_RPC_SMOKE ' "$RUNNER_TEMP/historical-smoke-one.log"; then
+              selected="$rpc"
+              cp "$RUNNER_TEMP/historical-smoke-one.log" "$RUNNER_TEMP/historical-smoke.log"
+              break
+            fi
+          done
+          if [ -z "$selected" ]; then
+            cat "$RUNNER_TEMP/historical-smoke-attempts.log"
+            echo "No free historical RPC passed the archive-state smoke."
+            exit 1
+          fi
+          echo "rpc_url=$selected" >> "$GITHUB_OUTPUT"
           python - <<'PY'
           import json, os
           from pathlib import Path
@@ -96,11 +122,17 @@ jobs:
       - name: Recompute deterministic overlap block
         if: steps.guard.outputs.skip != 'true'
         shell: bash
+        env:
+          ETH_RPC_URL: ${{ steps.smoke.outputs.rpc_url }}
         run: |
           set -euo pipefail
           rm -rf "$RUNNER_TEMP/backfill-overlap"
-          ai-arbitrage-historical-backfill             --start-block "$OVERLAP_BLOCK"             --end-block "$OVERLAP_BLOCK"             --output-dir "$RUNNER_TEMP/backfill-overlap"
-          cp "$RUNNER_TEMP/backfill-overlap/$OVERLAP_BLOCK.json"             "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-historical.json"
+          ai-arbitrage-historical-backfill \
+            --start-block "$OVERLAP_BLOCK" \
+            --end-block "$OVERLAP_BLOCK" \
+            --output-dir "$RUNNER_TEMP/backfill-overlap"
+          cp "$RUNNER_TEMP/backfill-overlap/$OVERLAP_BLOCK.json" \
+            "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-historical.json"
 
       - name: Compare live and historical economics
         if: steps.guard.outputs.skip != 'true'
