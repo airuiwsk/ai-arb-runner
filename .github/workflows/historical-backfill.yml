@@ -1,0 +1,233 @@
+name: AI Arbitrage Seven Day Backfill
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/historical-backfill.yml"
+  schedule:
+    - cron: "37 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-arb-seven-day-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      PRIVATE_REPO: airuiwsk/AI-Arbitrage
+      SOURCE_BRANCH: github-observer
+      ARCHIVE_BRANCH: telemetry
+      ETH_RPC_URL: https://eth-mainnet.g.alchemy.com/public
+      WINDOW_END: "26032286"
+      WINDOW_BLOCKS: "50400"
+      CHUNK_SIZE: "360"
+      HISTORICAL_WORKERS: "4"
+    steps:
+      - name: Check private token
+        id: guard
+        env:
+          PRIVATE_PAT: ${{ secrets.AI_ARBITRAGE_PAT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${PRIVATE_PAT:-}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout private scanner
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.SOURCE_BRANCH }}
+          token: ${{ secrets.AI_ARBITRAGE_PAT }}
+          path: source
+          persist-credentials: false
+
+      - name: Checkout telemetry archive
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.ARCHIVE_BRANCH }}
+          token: ${{ secrets.AI_ARBITRAGE_PAT }}
+          path: archive
+          persist-credentials: false
+
+      - name: Prepare chunk
+        if: steps.guard.outputs.skip != 'true'
+        id: chunk
+        shell: bash
+        run: |
+          set -euo pipefail
+          WINDOW_END="$WINDOW_END" WINDOW_BLOCKS="$WINDOW_BLOCKS" CHUNK_SIZE="$CHUNK_SIZE" python - <<'PY'
+          import json, os, time
+          from pathlib import Path
+
+          state_path = Path("archive/data/backfill/state.json")
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          if not state_path.exists():
+              with out.open("a") as f:
+                  f.write("should_run=false\n")
+                  f.write("reason=historical_gate_state_missing\n")
+              raise SystemExit(0)
+
+          state = json.loads(state_path.read_text())
+          if state.get("overlap_gate") != "pass":
+              with out.open("a") as f:
+                  f.write("should_run=false\n")
+                  f.write("reason=overlap_gate_not_passed\n")
+              raise SystemExit(0)
+
+          end = int(os.environ["WINDOW_END"])
+          count = int(os.environ["WINDOW_BLOCKS"])
+          start = end - count + 1
+          chunk_size = int(os.environ["CHUNK_SIZE"])
+          progress_path = Path("archive/data/backfill/progress.json")
+
+          if progress_path.exists():
+              progress = json.loads(progress_path.read_text())
+              if int(progress["window_start"]) != start or int(progress["window_end"]) != end:
+                  raise SystemExit("existing progress window does not match configured seven-day window")
+          else:
+              progress_path.parent.mkdir(parents=True, exist_ok=True)
+              progress = {
+                  "schema_version": 1,
+                  "window_start": start,
+                  "window_end": end,
+                  "total_blocks": count,
+                  "next_block": start,
+                  "completed_blocks": 0,
+                  "chunk_size": chunk_size,
+                  "workers": 4,
+                  "status": "running",
+                  "started_at_unix": int(time.time()),
+                  "read_only": True,
+                  "execution_enabled": False,
+                  "ready_for_execution": False,
+              }
+              progress_path.write_text(json.dumps(progress, indent=2, sort_keys=True) + "\n")
+
+          next_block = int(progress["next_block"])
+          if next_block > end:
+              progress["status"] = "complete"
+              progress["completed_at_unix"] = int(time.time())
+              progress_path.write_text(json.dumps(progress, indent=2, sort_keys=True) + "\n")
+              with out.open("a") as f:
+                  f.write("should_run=false\n")
+                  f.write("reason=complete\n")
+              raise SystemExit(0)
+
+          chunk_end = min(end, next_block + chunk_size - 1)
+          with out.open("a") as f:
+              f.write("should_run=true\n")
+              f.write(f"start={next_block}\n")
+              f.write(f"end={chunk_end}\n")
+              f.write(f"window_start={start}\n")
+              f.write(f"window_end={end}\n")
+          print(json.dumps({"chunk_start": next_block, "chunk_end": chunk_end, "window_start": start, "window_end": end}))
+          PY
+
+      - name: Set up Python
+        if: steps.guard.outputs.skip != 'true' && steps.chunk.outputs.should_run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scanner
+        if: steps.guard.outputs.skip != 'true' && steps.chunk.outputs.should_run == 'true'
+        run: python -m pip install -e source
+
+      - name: Backfill chunk
+        if: steps.guard.outputs.skip != 'true' && steps.chunk.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          START="${{ steps.chunk.outputs.start }}"
+          END="${{ steps.chunk.outputs.end }}"
+          mkdir -p archive/data/backfill/chunks
+          rm -rf "$RUNNER_TEMP/backfill-blocks"
+          ai-arbitrage-historical-backfill             --start-block "$START"             --end-block "$END"             --workers "$HISTORICAL_WORKERS"             --output-dir "$RUNNER_TEMP/backfill-blocks"             --compact-jsonl "archive/data/backfill/chunks/$START-$END.jsonl"             --discard-evidence
+
+      - name: Summarize chunk and advance checkpoint
+        if: steps.guard.outputs.skip != 'true' && steps.chunk.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          START="${{ steps.chunk.outputs.start }}"
+          END="${{ steps.chunk.outputs.end }}"
+          START="$START" END="$END" python - <<'PY'
+          import json, os, time
+          from pathlib import Path
+
+          start = int(os.environ["START"])
+          end = int(os.environ["END"])
+          data_path = Path(f"archive/data/backfill/chunks/{start}-{end}.jsonl")
+          rows = [json.loads(line) for line in data_path.read_text().splitlines() if line.strip()]
+          if len(rows) != end - start + 1:
+              raise SystemExit(f"chunk row count mismatch: got={len(rows)} expected={end-start+1}")
+
+          positive_counts = {}
+          max_profit_pct = {}
+          candidate_blocks = 0
+          for row in rows:
+              if row.get("c"):
+                  candidate_blocks += 1
+              for key, raw in (row.get("p") or {}).items():
+                  value = float(raw)
+                  if value > 0:
+                      positive_counts[key] = positive_counts.get(key, 0) + 1
+                  if key not in max_profit_pct or value > max_profit_pct[key]:
+                      max_profit_pct[key] = value
+
+          summary = {
+              "start_block": start,
+              "end_block": end,
+              "blocks": len(rows),
+              "candidate_blocks": candidate_blocks,
+              "positive_counts": positive_counts,
+              "max_profit_pct": max_profit_pct,
+              "scanner_generation": "v2_cached_batch",
+              "read_only": True,
+              "execution_enabled": False,
+          }
+          Path(f"archive/data/backfill/chunks/{start}-{end}.summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n"
+          )
+
+          progress_path = Path("archive/data/backfill/progress.json")
+          progress = json.loads(progress_path.read_text())
+          progress["next_block"] = end + 1
+          progress["completed_blocks"] = end - int(progress["window_start"]) + 1
+          progress["last_chunk_start"] = start
+          progress["last_chunk_end"] = end
+          progress["last_chunk_completed_at_unix"] = int(time.time())
+          if progress["next_block"] > int(progress["window_end"]):
+              progress["status"] = "complete"
+              progress["completed_at_unix"] = int(time.time())
+          progress_path.write_text(json.dumps(progress, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(summary, sort_keys=True))
+          PY
+
+      - name: Persist progress
+        if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd archive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/backfill
+          if ! git diff --cached --quiet; then
+            git commit -m "Advance seven-day historical backfill"
+            git push "https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git" HEAD:$ARCHIVE_BRANCH
+          fi
