@@ -144,12 +144,53 @@ jobs:
           OPPORTUNITY_EVENT_DIR: "telemetry/opportunities"
           PORT: "10000"
         run: |
+          set -euo pipefail
+          mkdir -p source/telemetry/history source/telemetry/opportunities archive/data/observer
+          cd archive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cd ..
+
+          flush_archive() {
+            python source/scripts/compact_observer_archive.py \
+              --history-dir source/telemetry/history \
+              --opportunity-dir source/telemetry/opportunities \
+              --archive-root archive
+            cd archive
+            git add data/telemetry data/opportunities
+            if ! git diff --cached --quiet; then
+              git commit -m "Hourly observer flush $GITHUB_RUN_ID"
+              git push "https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git" HEAD:$ARCHIVE_BRANCH
+            fi
+            cd ..
+          }
+
           set +e
-          cd source
-          mkdir -p telemetry/history telemetry/opportunities
-          timeout --signal=TERM --kill-after=30s "${{ steps.experiment.outputs.run_seconds }}s"             ai-arbitrage-monitor > "$RUNNER_TEMP/ai-arbitrage-monitor.log" 2>&1
+          (
+            cd source
+            timeout --signal=TERM --kill-after=30s "${{ steps.experiment.outputs.run_seconds }}s" \
+              ai-arbitrage-monitor > "$RUNNER_TEMP/ai-arbitrage-monitor.log" 2>&1
+          ) &
+          scanner_pid=$!
+          set -e
+
+          while kill -0 "$scanner_pid" 2>/dev/null; do
+            # Check every 15s so a scanner exit does not delay the workflow by an hour.
+            for _ in $(seq 1 240); do
+              if ! kill -0 "$scanner_pid" 2>/dev/null; then
+                break
+              fi
+              sleep 15
+            done
+            flush_archive
+          done
+
+          set +e
+          wait "$scanner_pid"
           rc=$?
           set -e
+          flush_archive
+
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 143 ]; then
             echo "scanner_exit=$rc"
             exit "$rc"
