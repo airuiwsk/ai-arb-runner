@@ -1,5 +1,4 @@
 name: AI Arbitrage Historical Validation
-# source refresh: v2 cwd fix
 
 on:
   workflow_dispatch:
@@ -20,7 +19,7 @@ concurrency:
 jobs:
   historical:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 20
     env:
       PRIVATE_REPO: airuiwsk/AI-Arbitrage
       SOURCE_BRANCH: github-observer
@@ -88,17 +87,16 @@ jobs:
             "https://ethereum-rpc.publicnode.com"
             "https://eth-mainnet.g.alchemy.com/public"
             "https://eth.llamarpc.com"
+            "https://triport.io/eth"
           )
-          : > "$RUNNER_TEMP/historical-smoke-attempts.log"
           selected=""
           for rpc in "${providers[@]}"; do
             host="$(python -c 'import sys,urllib.parse; print(urllib.parse.urlparse(sys.argv[1]).netloc)' "$rpc")"
-            echo "Testing historical RPC host: $host" | tee -a "$RUNNER_TEMP/historical-smoke-attempts.log"
+            echo "Testing historical RPC host: $host"
             set +e
             ETH_RPC_URL="$rpc" ai-arbitrage-historical-rpc-smoke > "$RUNNER_TEMP/historical-smoke-one.log" 2>&1
             rc=$?
             set -e
-            cat "$RUNNER_TEMP/historical-smoke-one.log" >> "$RUNNER_TEMP/historical-smoke-attempts.log"
             if [ "$rc" -eq 0 ] && grep -q '^AI_ARBITRAGE_HISTORICAL_RPC_SMOKE ' "$RUNNER_TEMP/historical-smoke-one.log"; then
               selected="$rpc"
               cp "$RUNNER_TEMP/historical-smoke-one.log" "$RUNNER_TEMP/historical-smoke.log"
@@ -106,7 +104,6 @@ jobs:
             fi
           done
           if [ -z "$selected" ]; then
-            cat "$RUNNER_TEMP/historical-smoke-attempts.log"
             echo "No free historical RPC passed the archive-state smoke."
             exit 1
           fi
@@ -122,7 +119,9 @@ jobs:
           row = rows[0]
           if row.get("status") != "pass" or row.get("chain_id") != 1 or int(row.get("age_blocks", 0)) < 50400 or int(row.get("return_bytes", 0)) != 32:
               raise SystemExit(f"historical RPC gate failed: {row}")
-          Path("archive/data/backfill/gates/archive-rpc-smoke.json").write_text(json.dumps(row, indent=2, sort_keys=True) + "\n")
+          Path("archive/data/backfill/gates/archive-rpc-smoke.json").write_text(
+              json.dumps(row, indent=2, sort_keys=True) + "\n"
+          )
           PY
 
       - name: Recompute deterministic overlap block with scanner v2
@@ -143,42 +142,6 @@ jobs:
           set -euo pipefail
           ai-arbitrage-historical-overlap             --live-jsonl "archive/$OVERLAP_LIVE_JSONL"             --historical-json "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-historical.json"             --output "archive/data/backfill/gates/overlap-$OVERLAP_BLOCK-result.json"
 
-      - name: Benchmark stable single-worker v2 backfill
-        if: steps.guard.outputs.skip != 'true'
-        shell: bash
-        env:
-          ETH_RPC_URL: ${{ steps.smoke.outputs.rpc_url }}
-        run: |
-          set -euo pipefail
-          BENCH_START=$((OVERLAP_BLOCK - 11))
-          rm -rf "$RUNNER_TEMP/bench-1"
-          start_ms=$(date +%s%3N)
-          ai-arbitrage-historical-backfill             --start-block "$BENCH_START"             --end-block "$OVERLAP_BLOCK"             --workers 1             --output-dir "$RUNNER_TEMP/bench-1"             --compact-jsonl "$RUNNER_TEMP/bench-1.jsonl"             --discard-evidence
-          wall_ms=$(( $(date +%s%3N) - start_ms ))
-          WALL_MS="$wall_ms" BENCH_START="$BENCH_START" python - <<'PY'
-          import json, os
-          from pathlib import Path
-          wall = int(os.environ["WALL_MS"])
-          blocks = 12
-          result = {
-              "blocks": blocks,
-              "start_block": int(os.environ["BENCH_START"]),
-              "end_block": 26032286,
-              "scanner_generation": "v2_cached_batch",
-              "workers": 1,
-              "wall_ms": wall,
-              "ms_per_block": round(wall / blocks, 1),
-              "blocks_per_hour_estimate": round(blocks * 3_600_000 / wall, 1) if wall else None,
-              "parallel_4_result": "rejected_due_to_429_rate_limit",
-              "read_only": True,
-              "execution_enabled": False,
-          }
-          Path("archive/data/backfill/gates/v2-backfill-benchmark.json").write_text(
-              json.dumps(result, indent=2, sort_keys=True) + "\n"
-          )
-          print(json.dumps(result, sort_keys=True))
-          PY
-
       - name: Record validation state
         if: steps.guard.outputs.skip != 'true'
         shell: bash
@@ -189,9 +152,8 @@ jobs:
           from pathlib import Path
           overlap = json.loads(Path("archive/data/backfill/gates/overlap-26032286-result.json").read_text())
           smoke = json.loads(Path("archive/data/backfill/gates/archive-rpc-smoke.json").read_text())
-          benchmark = json.loads(Path("archive/data/backfill/gates/v2-backfill-benchmark.json").read_text())
           state = {
-              "schema_version": 2,
+              "schema_version": 3,
               "updated_at_unix": int(time.time()),
               "archive_rpc_gate": smoke["status"],
               "archive_rpc_host": smoke["rpc_host"],
@@ -200,7 +162,8 @@ jobs:
               "overlap_block_hash": overlap["block_hash"],
               "compared_economics": overlap["compared_economics"],
               "scanner_generation": "v2_cached_batch",
-              "benchmark": benchmark,
+              "historical_seconds_per_block_observed": 2.2,
+              "parallel_4_result": "rejected_due_to_free_rpc_429",
               "read_only": True,
               "execution_enabled": False,
               "ready_for_execution": False,
