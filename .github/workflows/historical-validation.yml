@@ -1,4 +1,5 @@
 name: AI Arbitrage Historical Validation
+# source refresh: v2 cwd fix
 
 on:
   workflow_dispatch:
