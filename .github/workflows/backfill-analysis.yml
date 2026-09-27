@@ -1,0 +1,138 @@
+name: AI Arbitrage Backfill Analysis
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "47 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PRIVATE_REPO: airuiwsk/AI-Arbitrage
+      ARCHIVE_BRANCH: telemetry
+    steps:
+      - name: Check private token
+        id: guard
+        env:
+          PRIVATE_PAT: ${{ secrets.AI_ARBITRAGE_PAT }}
+        shell: bash
+        run: |
+          if [ -z "${PRIVATE_PAT:-}" ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; else echo "skip=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Checkout telemetry archive
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.ARCHIVE_BRANCH }}
+          token: ${{ secrets.AI_ARBITRAGE_PAT }}
+          path: archive
+          persist-credentials: false
+
+      - name: Aggregate completed seven-day backfill
+        if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root=Path("archive/data/backfill")
+          progress=json.loads((root/"progress.json").read_text())
+          if progress.get("status")!="complete" or progress.get("completed_blocks")!=progress.get("total_blocks"):
+              raise SystemExit("backfill is not complete")
+
+          summaries=sorted((root/"chunks").glob("*.summary.json"))
+          total_blocks=0
+          candidate_blocks=0
+          positive_counts={}
+          max_profit_pct={}
+          for p in summaries:
+              s=json.loads(p.read_text())
+              total_blocks += int(s["blocks"])
+              candidate_blocks += int(s.get("candidate_blocks",0))
+              for k,v in (s.get("positive_counts") or {}).items():
+                  positive_counts[k]=positive_counts.get(k,0)+int(v)
+              for k,v in (s.get("max_profit_pct") or {}).items():
+                  v=float(v)
+                  if k not in max_profit_pct or v>max_profit_pct[k]:
+                      max_profit_pct[k]=v
+
+          expected=int(progress["total_blocks"])
+          if total_blocks != expected:
+              raise SystemExit(f"summary block count mismatch: {total_blocks} != {expected}")
+
+          keys=sorted(max_profit_pct)
+          routes={}
+          for k in keys:
+              pos=positive_counts.get(k,0)
+              routes[k]={
+                  "positive_blocks":pos,
+                  "positive_frequency":pos/total_blocks,
+                  "max_profit_pct":max_profit_pct[k],
+              }
+
+          # If no block is positive, +1/+2 positive-survival counts are necessarily zero.
+          # If positives appear, exact sequential survival must be computed from JSONL.
+          no_positive = sum(positive_counts.values()) == 0
+          result={
+              "schema_version":1,
+              "window_start":progress["window_start"],
+              "window_end":progress["window_end"],
+              "blocks":total_blocks,
+              "chunk_summaries":len(summaries),
+              "candidate_blocks":candidate_blocks,
+              "routes":routes,
+              "any_positive_route_capital_block":not no_positive,
+              "positive_survival_plus_1": 0 if no_positive else None,
+              "positive_survival_plus_2": 0 if no_positive else None,
+              "survival_note":"No positive block exists, so +1/+2 positive survival is zero." if no_positive else "Requires exact JSONL sequential aggregation.",
+              "read_only":True,
+              "execution_enabled":False,
+              "ready_for_execution":False,
+          }
+          (root/"analysis.json").write_text(json.dumps(result,indent=2,sort_keys=True)+"\n")
+
+          lines=[
+              "# Seven-day historical backfill analysis","",
+              f"- Blocks: {total_blocks:,}",
+              f"- Chunk summaries: {len(summaries)}",
+              f"- Candidate blocks: {candidate_blocks:,}",
+              f"- Any explicit-cost positive route/capital block: {'YES' if not no_positive else 'NO'}","",
+              "| Route × capital | Positive blocks | Frequency | Max profit % |",
+              "|---|---:|---:|---:|",
+          ]
+          for k in keys:
+              r=routes[k]
+              lines.append(f"| {k} | {r['positive_blocks']:,} | {r['positive_frequency']:.6%} | {r['max_profit_pct']:.6f}% |")
+          lines += ["",result["survival_note"],"",
+                    "Safety: read-only analysis; execution remains disabled."]
+          (root/"analysis.md").write_text("\n".join(lines)+"\n")
+          print(json.dumps(result,sort_keys=True))
+          PY
+
+      - name: Persist analysis
+        if: steps.guard.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd archive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/backfill/analysis.json data/backfill/analysis.md
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Aggregate seven-day historical backfill"
+          REMOTE="https://x-access-token:${{ secrets.AI_ARBITRAGE_PAT }}@github.com/$PRIVATE_REPO.git"
+          for attempt in 1 2 3 4 5; do
+            git fetch "$REMOTE" "$ARCHIVE_BRANCH"
+            git rebase FETCH_HEAD
+            if git push "$REMOTE" HEAD:$ARCHIVE_BRANCH; then exit 0; fi
+            sleep $((attempt * 3))
+          done
+          exit 1
