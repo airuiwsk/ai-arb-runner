@@ -1,0 +1,48 @@
+name: AI Arbitrage Realtime Keepalive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-arbitrage-realtime-keepalive
+  cancel-in-progress: true
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Wake and verify realtime observer
+        shell: bash
+        env:
+          HEALTH_URL: https://ai-arbitrage-monitor.onrender.com/health
+        run: |
+          set -euo pipefail
+          body=""
+          for attempt in 1 2 3 4 5 6; do
+            if body="$(curl --fail --silent --show-error --max-time 20 "$HEALTH_URL")"; then break; fi
+            echo "health attempt $attempt failed; retrying"
+            sleep 20
+          done
+          test -n "$body"
+          echo "$body" > health.json
+          python - <<'PY'
+          import json, time
+          with open("health.json", encoding="utf-8") as f:
+              h=json.load(f)
+          assert h.get("read_only") is True
+          assert h.get("execution_enabled") is False
+          last=h.get("last_success_unix")
+          if not isinstance(last, int):
+              print("Observer reachable; first successful scan is still pending.")
+          else:
+              age=int(time.time())-last
+              print(f"Observer last_success age={age}s block={h.get('last_block')}")
+              if age > 600:
+                  raise SystemExit(f"realtime observer stale: last_success age={age}s")
+          PY
