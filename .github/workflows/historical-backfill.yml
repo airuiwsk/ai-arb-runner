@@ -1,5 +1,5 @@
 name: AI Arbitrage Seven Day Backfill
-# gate unlocked: scanner-v2 overlap PASS
+# gate unlocked: scanner-v2 overlap PASS\n# completed windows are analyzed by backfill-analysis.yml
 
 on:
   workflow_dispatch:
