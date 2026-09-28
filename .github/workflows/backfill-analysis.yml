@@ -78,9 +78,36 @@ jobs:
                   "max_profit_pct":max_profit_pct[k],
               }
 
-          # If no block is positive, +1/+2 positive-survival counts are necessarily zero.
-          # If positives appear, exact sequential survival must be computed from JSONL.
+          # Scan compact JSONL exactly when positives exist so we can identify the
+          # opportunity block and measure whether it survives +1/+2 blocks.
           no_positive = sum(positive_counts.values()) == 0
+          positive_events=[]
+          survival_1=0
+          survival_2=0
+          if not no_positive:
+              by_block={}
+              for p in sorted((root/"chunks").glob("*.jsonl")):
+                  for line in p.read_text().splitlines():
+                      if not line.strip(): continue
+                      row=json.loads(line)
+                      b=int(row["b"])
+                      by_block[b]=row
+              for b,row in sorted(by_block.items()):
+                  for k,raw in (row.get("p") or {}).items():
+                      v=float(raw)
+                      if v <= 0: continue
+                      v1=float((by_block.get(b+1,{}).get("p") or {}).get(k, float("-inf")))
+                      v2=float((by_block.get(b+2,{}).get("p") or {}).get(k, float("-inf")))
+                      s1=v1>0
+                      s2=v2>0
+                      survival_1 += int(s1)
+                      survival_2 += int(s2)
+                      positive_events.append({
+                          "block":b,"route_capital":k,"profit_pct":v,
+                          "plus_1_profit_pct":None if v1==float("-inf") else v1,
+                          "plus_2_profit_pct":None if v2==float("-inf") else v2,
+                          "survives_plus_1":s1,"survives_plus_2":s2
+                      })
           result={
               "schema_version":1,
               "window_start":progress["window_start"],
@@ -90,9 +117,10 @@ jobs:
               "candidate_blocks":candidate_blocks,
               "routes":routes,
               "any_positive_route_capital_block":not no_positive,
-              "positive_survival_plus_1": 0 if no_positive else None,
-              "positive_survival_plus_2": 0 if no_positive else None,
-              "survival_note":"No positive block exists, so +1/+2 positive survival is zero." if no_positive else "Requires exact JSONL sequential aggregation.",
+              "positive_survival_plus_1": survival_1,
+              "positive_survival_plus_2": survival_2,
+              "positive_events": positive_events,
+              "survival_note":"Exact sequential JSONL aggregation complete.",
               "read_only":True,
               "execution_enabled":False,
               "ready_for_execution":False,
@@ -111,7 +139,13 @@ jobs:
           for k in keys:
               r=routes[k]
               lines.append(f"| {k} | {r['positive_blocks']:,} | {r['positive_frequency']:.6%} | {r['max_profit_pct']:.6f}% |")
-          lines += ["",result["survival_note"],"",
+          lines += ["",result["survival_note"],""]
+          if positive_events:
+              lines += ["| Positive block | Route × capital | Profit % | +1 % | +2 % | +1 survives | +2 survives |",
+                        "|---:|---|---:|---:|---:|---|---|"]
+              for e in positive_events:
+                  lines.append(f"| {e['block']} | {e['route_capital']} | {e['profit_pct']:.6f}% | {e['plus_1_profit_pct']} | {e['plus_2_profit_pct']} | {e['survives_plus_1']} | {e['survives_plus_2']} |")
+          lines += ["",
                     "Safety: read-only analysis; execution remains disabled."]
           (root/"analysis.md").write_text("\n".join(lines)+"\n")
           print(json.dumps(result,sort_keys=True))
